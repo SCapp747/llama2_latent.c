@@ -145,7 +145,7 @@ class Attention(nn.Module):
 
         # flash implementation
         if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=False)
         else:
             # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -204,7 +204,6 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    last_loss: Optional[torch.Tensor]
 
     def __init__(self, params: ModelArgs):
         super().__init__()
@@ -218,10 +217,10 @@ class Transformer(nn.Module):
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.output = nn.Linear(params.dim, 1, bias=False)
 
         # share the unembedding parameters with the embedding parameters
-        self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
+        # self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
 
         # some useful precompute for the RoPE relative positional embeddings
         freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len)
@@ -235,8 +234,6 @@ class Transformer(nn.Module):
             if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
 
-        # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
-        self.last_loss = None
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -246,7 +243,7 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
@@ -256,16 +253,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, freqs_cos, freqs_sin)
         h = self.norm(h)
-
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            self.last_loss = None
-
+        logits = self.output(h)
         return logits
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
