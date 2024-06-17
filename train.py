@@ -31,6 +31,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tinystories import Task
 from export import model_export
 
+mse_loss = torch.nn.MSELoss()
+
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"
