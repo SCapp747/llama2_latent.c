@@ -119,7 +119,6 @@ def train_vocab(vocab_size):
                                    num_threads=os.cpu_count(),
                                    split_digits=True,
                                    allow_whitespace_only_pieces=True,
-                                   byte_fallback=True,
                                    unk_surface=r" \342\201\207 ",
                                    normalization_rule_name="identity",
                                    user_defined_symbols=["[MASK]"])
