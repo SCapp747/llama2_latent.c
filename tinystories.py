@@ -20,6 +20,15 @@ from tqdm import tqdm
 
 from tokenizer import Tokenizer
 
+np.random.seed(42)
+def corrupt(arr, mask_percentage, mask_number):
+    num_elements_to_change = int(len(arr) * mask_percentage * 0.01)
+    indices_to_change = np.random.choice(len(arr), num_elements_to_change, replace=False)
+    arr[indices_to_change] = mask_number
+    return arr
+mask_token_per = 20
+mask_token_num = 3
+
 DATA_CACHE_DIR = "data"
 
 def download_file(url: str, fname: str, chunk_size=1024):
@@ -112,14 +121,10 @@ def train_vocab(vocab_size):
                                    allow_whitespace_only_pieces=True,
                                    byte_fallback=True,
                                    unk_surface=r" \342\201\207 ",
-                                   normalization_rule_name="identity")
+                                   normalization_rule_name="identity",
+                                   user_defined_symbols=["[MASK]"])
 
-    # 3) optional cleanup, ask the user if they'd like to delete tiny.txt
-    dec = input(f"Delete the temporary file {tiny_file}? [y/N] ")
-    if dec.lower() == "y":
-        os.remove(tiny_file)
-        print(f"Deleted {tiny_file}")
-
+    os.remove(tiny_file)
     print(f"Trained tokenizer is in {prefix}.model")
     print("Done.")
 
@@ -131,7 +136,7 @@ def process_shard(args, vocab_size):
     with open(shard, "r") as f:
         data = json.load(f)
     all_tokens = []
-    for example in tqdm(data, position=shard_id):
+    for example in data:
         text = example["story"]
         text = text.strip()  # get rid of leading/trailing whitespace
         tokens = enc.encode(text, bos=True, eos=False)  # encode the text, use BOS
@@ -215,11 +220,10 @@ class PretokDataset(torch.utils.data.IterableDataset):
                 rng.shuffle(ixs)
                 for ix in ixs:
                     start = ix * self.max_seq_len
-                    end = start + self.max_seq_len + 1
+                    end = start + self.max_seq_len
                     # calling .astype will copy the data into a new numpy array, now in RAM
-                    chunk = torch.from_numpy((m[start:end]).astype(np.int64))
-                    x = chunk[:-1]
-                    y = chunk[1:]
+                    x = torch.from_numpy((m[start:end]).astype(np.int64))
+                    y = torch.from_numpy(corrupt((m[start:end]).astype(np.int64)))
                     yield x, y
 
 # -----------------------------------------------------------------------------
