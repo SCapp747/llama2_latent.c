@@ -83,11 +83,19 @@ config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 
 # fixing some hyperparams to sensible defaults
 lr_decay_iters = max_iters  # should be ~= max_iters per Chinchilla
-min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+min_lr = learning_rate/10  # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 
 # validating checks
 assert vocab_source in ["llama2", "custom"]
 assert vocab_source == "custom" or vocab_size == 32000, "The vocab from Meta has 32K tokens"
+
+@torch.no_grad()
+def update_ema_variables(model, ema_model, ema_decay):
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.copy_(ema_param.data * ema_decay + (1 - ema_decay) * param.data)
+    
+    for ema_buffer, buffer in zip(ema_model.buffers(), model.buffers()):
+        ema_buffer.copy_(ema_buffer * ema_decay + (1 - ema_decay) * buffer)
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
@@ -159,6 +167,7 @@ if init_from == "scratch":
     print("Initializing a new model from scratch")
     gptconf = ModelArgs(**model_args)
     model = Transformer(gptconf)
+    ema_model = Transformer(gptconf)
 elif init_from == "resume":
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -183,6 +192,7 @@ elif init_from == "resume":
     iter_num = checkpoint["iter_num"]
     best_val_loss = checkpoint["best_val_loss"]
 model.to(device)
+ema_model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
@@ -195,9 +205,10 @@ checkpoint = None  # free up memory
 
 # compile the model
 if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
+    print("compiling the models... (takes a ~minute)")
     model = torch.compile(model)  # requires PyTorch 2.0
+    ema_model = torch.compile(ema_model)
+    
 
 # wrap model into DDP container
 if ddp:
@@ -218,8 +229,9 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = next(batch_iter)
             with ctx:
-                logits = model(X, Y)
-                loss = raw_model.last_loss
+                model_logits = model(X)
+                ema_logits = ema_model(Y)
+                loss = mse_loss(model_logits, ema_logits)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -279,7 +291,7 @@ while True:
             best_val_loss = losses["val"]
             if iter_num > 0:
                 checkpoint = {
-                    "model": raw_model.state_dict(),
+                    "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "model_args": model_args,
                     "iter_num": iter_num,
@@ -288,7 +300,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
-                model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
+                model_export(model, os.path.join(out_dir, "model.bin"), version=0)
     if iter_num == 0 and eval_only:
         break
 
@@ -302,8 +314,9 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = micro_step == gradient_accumulation_steps - 1
         with ctx:
-            logits = model(X, Y)
-            loss = raw_model.last_loss
+            model_logits = model(X)
+            ema_logits = ema_model(Y)
+            loss = mse_loss(model_logits, ema_logits)
             loss = loss / gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = next(train_batch_iter)
@@ -318,6 +331,7 @@ while True:
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+    update_ema_variables(model, ema_model, 0.99)
 
     # timing and logging
     t1 = time.time()
